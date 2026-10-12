@@ -137,8 +137,8 @@ extension AppState {
 
     /// Every picture write (including hotkeys and menu-bar controls) goes through this path.
     /// Capture the preset identity NOW, not when the delayed readback eventually runs.
-    func runPictureChange(delay: TimeInterval = 1.2, _ work: @escaping () -> Void) {
-        guard isConnected, !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
+    func runPictureChange(delay: TimeInterval = 1.2, completion: (() -> Void)? = nil, _ work: @escaping () -> Void) {
+        guard isConnected, !isPresetBusy, !presetConfiguration.applicationIncomplete else { completion?(); return }
         let request = connectionIntent.generation
         let identity = adb.ip
         let presetID = activePresetID
@@ -151,14 +151,16 @@ extension AppState {
             let current = DispatchQueue.main.sync {
                 self.isConnected && self.connectionIntent.isCurrent(request) && self.adb.ip == identity
             }
-            guard current else { return }
+            guard current else { DispatchQueue.main.async { completion?() }; return }
             self.adb.transaction(work)
             self.pictureSettleUntil = Date().addingTimeInterval(delay)
             DispatchQueue.main.async {
-                guard self.connectionIntent.isCurrent(request), self.adb.ip == identity,
-                      self.activePresetID == presetID, self.pictureEditRevision == revision,
-                      !self.isPresetBusy, let presetID else { return }
-                self.schedulePresetSave(id: presetID, request: request, revision: revision, delay: delay)
+                if self.connectionIntent.isCurrent(request), self.adb.ip == identity,
+                   self.activePresetID == presetID, self.pictureEditRevision == revision,
+                   !self.isPresetBusy, let presetID {
+                    self.schedulePresetSave(id: presetID, request: request, revision: revision, delay: delay)
+                }
+                completion?()
             }
         }
     }
@@ -198,6 +200,10 @@ extension AppState {
         isPresetOperationInFlight = true
         isPresetBusy = refresh || navigateToPicture
         presetOperationText = label
+        // 预设/自动任务直接写 JNI+settings，不走 setPictureSlider，
+        // 所以这里丢掉背光预览，下次亮度键以新的设备值为准。
+        mediaBrightnessPreview = nil
+        mediaBrightnessHardware = nil
         if refresh || navigateToPicture { invalidatePictureRefreshesForPreset() }
         let hudToken = switchHUDTitle.map { HUDWindow.shared.beginOperation(title: $0) }
         updateHdrMemoryStatus()

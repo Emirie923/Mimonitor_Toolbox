@@ -367,6 +367,12 @@ final class AdbClient {
         shell("settings put global \(key) \(value)")
     }
 
+    /// 一次 shell 写多个 settings，省掉每条一次 ADB 往返。
+    func settingsPutBatch(_ pairs: [(String, String)]) {
+        guard !pairs.isEmpty else { return }
+        shell(pairs.map { "settings put global \($0.0) \($0.1)" }.joined(separator: "; "))
+    }
+
     func keyevent(_ code: String) {
         shell("input keyevent \(code)")
     }
@@ -399,6 +405,31 @@ final class AdbClient {
     func jniSet(key: String, value: String, upd: Int = 3) {
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "set", key, value, String(upd)]))
+    }
+
+    /// 平滑渐变：在显示器端把 key 从 from 推到 to，跑完后再落 settings。
+    /// 显示器自带的亮度键就是这样一小步一小步走的；单次大步长会让面板过冲、看起来像闪。
+    /// `from` 由 App 侧的粘性预览链给出，刻意不回读设备 —— JNI 回读值偶发跳变会把起点带偏。
+    ///
+    /// 默认 `stepMs = 0`（不等、最快），步长 `step` 由调用方按 delta 算，
+    /// 把总步数压在十几步内，避免长按后旧的渐变拖很久、把后续点按都堵在后面。
+    ///
+    /// settings 必须等渐变结束再写：`picture_backlight` 的 ContentObserver 会直接改硬件，
+    /// 提前写会把画面一下拉到目标值（先闪到目标、再被渐变拉回起点，观感就是来回闪）。
+    /// 这里在设备侧用一个等待循环等渐变写完成标记，再执行 `settings put`。
+    func jniRamp(key: String, from: Int, to: Int, settingsKeys: [String] = [],
+                 upd: Int = 3, stepMs: Int = 0, step: Int = 1) {
+        let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+        let dir = "/sdcard/Download/Mimonitor_Toolbox"
+        let done = "\(dir)/.mtk_ramp_done"
+        let ramp = buildTvserviceCommand(jar: jar, args: [
+            "MtkDirectTool", "ramp", key, String(from), String(to), String(upd),
+            String(stepMs), done, String(step)
+        ])
+        var parts = ["mkdir -p \(dir)", "rm -f \(done)", "\(ramp) >/dev/null"]
+        parts.append("i=0; while [ $i -lt 80 ] && [ ! -f \(done) ]; do sleep 0.1; i=$((i+1)); done")
+        parts.append(contentsOf: settingsKeys.map { "settings put global \($0) \(to)" })
+        shell(parts.joined(separator: "; "))
     }
 
     func hdrToneMapping(_ value: String, upd: Int = 3) {
