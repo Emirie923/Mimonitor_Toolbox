@@ -342,6 +342,46 @@ struct HotkeyConfigSheet: View {
                     Text("鼠标不在目标显示器上时，亮度键交回系统处理（去调内置屏亮度）。")
                         .font(.caption)
                         .foregroundColor(.secondary)
+
+                    Divider().padding(.vertical, 4)
+
+                    // 系统音量调节键接管为显示器音量。
+                    HStack(spacing: 12) {
+                        Toggle("音量调节键调显示器音量", isOn: $state.mediaVolumeKeysEnabled)
+                            .toggleStyle(.checkbox)
+                        if !state.mediaVolumeNativeOSD {
+                            Stepper("步长 \(state.mediaVolumeStep)", value: $state.mediaVolumeStep, in: 1...100)
+                                .frame(width: 140)
+                                .disabled(!state.mediaVolumeKeysEnabled)
+                        }
+                        Spacer()
+                    }
+                    Text("开启后音量加减键、静音键接管为显示器音量（0~100，一次一格）；仅在默认音频输出匹配下方设备时生效，其余情况交回系统。需辅助功能权限，且已连接显示器。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle("使用 macOS 原生音量提示（OSD）", isOn: $state.mediaVolumeNativeOSD)
+                        .toggleStyle(.checkbox)
+                        .disabled(!state.mediaVolumeKeysEnabled)
+                    Text(state.mediaVolumeNativeOSD
+                         ? "开启后按音量键弹出系统原生音量条（与系统音量键同款）；失败自动回退本应用悬浮提示。"
+                         : "开启后按音量键弹出系统原生音量条；关掉则用本应用的悬浮提示。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle("仅当默认音频输出为指定设备时接管", isOn: $state.mediaVolumeOutputGateEnabled)
+                        .toggleStyle(.checkbox)
+                        .disabled(!state.mediaVolumeKeysEnabled)
+                    HStack(spacing: 8) {
+                        Text("音频输出设备名")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        TextField("Mi Monitor", text: $state.mediaVolumeOutputName)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 200)
+                        Spacer()
+                    }
+                    .disabled(!state.mediaVolumeKeysEnabled || !state.mediaVolumeOutputGateEnabled)
                 }
                 .padding(16)
             }

@@ -171,14 +171,37 @@ final class HotkeyManager {
     private static let mediaKeyStateDown: Int = 0xA
     static let keyTypeBrightnessUp: Int32 = 2      // NX_KEYTYPE_BRIGHTNESS_UP
     static let keyTypeBrightnessDown: Int32 = 3    // NX_KEYTYPE_BRIGHTNESS_DOWN
+    static let keyTypeVolumeUp: Int32 = 0          // NX_KEYTYPE_SOUND_UP
+    static let keyTypeVolumeDown: Int32 = 1        // NX_KEYTYPE_SOUND_DOWN
+    static let keyTypeMute: Int32 = 7              // NX_KEYTYPE_MUTE
     static let mediaBrightnessUpID = "media_brightness_up"
     static let mediaBrightnessDownID = "media_brightness_down"
-    /// 亮度调节键以普通 keyDown 到达时的键码（调亮 / 调暗）。
+    static let mediaVolumeUpID = "media_volume_up"
+    static let mediaVolumeDownID = "media_volume_down"
+    static let mediaMuteID = "media_volume_mute"
+    /// 媒体键以普通 keyDown 到达时的键码（亮度 144/145、音量 72/73/74）。
     private static let mediaKeyDownBrightnessUp: Int64 = 144
     private static let mediaKeyDownBrightnessDown: Int64 = 145
-    /// 功能键当标准功能键时的兜底键码（调亮 F2 / 调暗 F1）。
+    private static let mediaKeyDownVolumeUp: Int64 = 72
+    private static let mediaKeyDownVolumeDown: Int64 = 73
+    private static let mediaKeyDownMute: Int64 = 74
+    /// 功能键当标准功能键时的兜底键码
+    /// （调亮 F2 / 调暗 F1、音量加 F12 / 减 F11 / 静音 F10）。
     static let keyCodeBrightnessUp = CGKeyCode(kVK_F2)
     static let keyCodeBrightnessDown = CGKeyCode(kVK_F1)
+    static let keyCodeVolumeUp = CGKeyCode(kVK_F12)
+    static let keyCodeVolumeDown = CGKeyCode(kVK_F11)
+    static let keyCodeMute = CGKeyCode(kVK_F10)
+
+    /// 是否是亮度键的 NX_KEYTYPE
+    static func isBrightnessKeyType(_ keyType: Int32) -> Bool {
+        keyType == keyTypeBrightnessUp || keyType == keyTypeBrightnessDown
+    }
+
+    /// 是否是音量键的 NX_KEYTYPE（含静音）
+    static func isVolumeKeyType(_ keyType: Int32) -> Bool {
+        keyType == keyTypeVolumeUp || keyType == keyTypeVolumeDown || keyType == keyTypeMute
+    }
 
     private var bindings: [Binding] = []
     private var mediaBindings: [MediaBinding] = []
@@ -198,9 +221,9 @@ final class HotkeyManager {
     /// 诊断用：收到系统媒体键（亮度/音量…）时回调，参数为键类型与是否按下
     var onMediaKeyEvent: ((Int32, Bool) -> Void)?
 
-    /// 媒体键是否该由本应用处理。返回 false 时事件原样放行给系统
-    /// （多屏时只在焦点位于目标显示器上才拦截）。
-    var shouldHandleMediaKey: (() -> Bool)?
+    /// 媒体键是否该由本应用处理（参数为 NX_KEYTYPE）。返回 false 时事件原样放行给系统
+    /// —— 亮度键看焦点是否在目标显示器上，音量键看当前音频输出是不是显示器。
+    var shouldHandleMediaKey: ((Int32) -> Bool)?
 
     /// 监听被系统禁用时回调
     var onTapDisabled: (() -> Void)?
@@ -322,7 +345,7 @@ final class HotkeyManager {
         guard !mediaBindings.isEmpty else { return false }
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         guard let keyType = Self.mediaKeyType(forKeyCode: keyCode) else { return false }
-        guard shouldHandleMediaKey?() ?? true else { return false }
+        guard shouldHandleMediaKey?(keyType) ?? true else { return false }
         for binding in mediaBindings where binding.keyType == keyType {
             onTrigger?(binding.id)
             return true
@@ -330,11 +353,16 @@ final class HotkeyManager {
         return false
     }
 
-    /// 把「以普通 keyDown 到达」的亮度键键码映射到 NX_KEYTYPE。抽出来方便单测。
+    /// 把「以普通 keyDown 到达」的媒体键键码映射到 NX_KEYTYPE。抽出来方便单测。
     static func mediaKeyType(forKeyCode keyCode: Int64) -> Int32? {
-        if keyCode == mediaKeyDownBrightnessUp { return keyTypeBrightnessUp }
-        if keyCode == mediaKeyDownBrightnessDown { return keyTypeBrightnessDown }
-        return nil
+        switch keyCode {
+        case mediaKeyDownBrightnessUp: return keyTypeBrightnessUp
+        case mediaKeyDownBrightnessDown: return keyTypeBrightnessDown
+        case mediaKeyDownVolumeUp: return keyTypeVolumeUp
+        case mediaKeyDownVolumeDown: return keyTypeVolumeDown
+        case mediaKeyDownMute: return keyTypeMute
+        default: return nil
+        }
     }
 
     /// 处理 NX_SYSDEFINED 事件。返回 true 表示这是已注册的亮度调节键，
@@ -347,7 +375,7 @@ final class HotkeyManager {
         // 只看按下，抬起事件原样放行
         guard isDown else { return false }
         receivedMediaKeyEvents += 1
-        guard shouldHandleMediaKey?() ?? true else { return false }
+        guard shouldHandleMediaKey?(keyType) ?? true else { return false }
         for binding in mediaBindings where binding.keyType == keyType {
             onTrigger?(binding.id)
             return true

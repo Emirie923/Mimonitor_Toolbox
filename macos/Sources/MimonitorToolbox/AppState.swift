@@ -157,6 +157,39 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(mediaBrightnessDisplayName, forKey: "media_brightness_display_name") }
     }
 
+    /// 是否把系统音量调节键接管为显示器音量。
+    /// 只在「当前默认音频输出匹配目标设备」时生效，否则交回系统去调内置扬声器/AirPods。
+    @Published var mediaVolumeKeysEnabled = UserDefaults.standard.bool(forKey: "media_volume_keys_enabled") {
+        didSet {
+            UserDefaults.standard.set(mediaVolumeKeysEnabled, forKey: "media_volume_keys_enabled")
+            applyHotkeys()
+            if mediaVolumeKeysEnabled {
+                if !HotkeyManager.isTrusted { HotkeyManager.requestAccessibility() }
+                refreshMediaVolumeState()
+            }
+        }
+    }
+
+    /// 关掉原生音量 OSD 时，每按一次的音量步长
+    @Published var mediaVolumeStep = UserDefaults.standard.object(forKey: "media_volume_step") as? Int ?? 5 {
+        didSet { UserDefaults.standard.set(mediaVolumeStep, forKey: "media_volume_step") }
+    }
+
+    /// 音量键是否显示 macOS 原生音量 OSD（走私有 OSDUIHelper，失败回退本应用 HUD）。
+    @Published var mediaVolumeNativeOSD = UserDefaults.standard.object(forKey: "media_volume_native_osd") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(mediaVolumeNativeOSD, forKey: "media_volume_native_osd") }
+    }
+
+    /// 是否只在默认音频输出匹配指定名称时才接管音量键
+    @Published var mediaVolumeOutputGateEnabled = UserDefaults.standard.object(forKey: "media_volume_output_gate") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(mediaVolumeOutputGateEnabled, forKey: "media_volume_output_gate") }
+    }
+
+    /// 目标音频输出设备名（CoreAudio 设备名，匹配用「包含」）
+    @Published var mediaVolumeOutputName = UserDefaults.standard.string(forKey: "media_volume_output_name") ?? "Mi Monitor" {
+        didSet { UserDefaults.standard.set(mediaVolumeOutputName, forKey: "media_volume_output_name") }
+    }
+
     private var hdrLastState: Bool?
     private var logFileHandle: FileHandle?
     private var logFileURL: URL?
@@ -195,9 +228,16 @@ final class AppState: ObservableObject {
             guard let self, self.hotkeyDebugEnabled else { return }
             self.log("媒体键诊断: 类型 \(keyType) \(isDown ? "按下" : "抬起")")
         }
-        // 多屏：只在焦点于目标显示器时才拦截亮度键，否则交回系统。
-        hotkeyManager.shouldHandleMediaKey = { [weak self] in
-            self?.shouldHandleMediaBrightnessForFocus() ?? true
+        // 媒体键拦截门：亮度键看多屏焦点，音量键看当前默认音频输出，其余一律放行。
+        hotkeyManager.shouldHandleMediaKey = { [weak self] keyType in
+            guard let self else { return true }
+            if HotkeyManager.isBrightnessKeyType(keyType) {
+                return self.shouldHandleMediaBrightnessForFocus()
+            }
+            if HotkeyManager.isVolumeKeyType(keyType) {
+                return self.shouldHandleNativeVolume()
+            }
+            return false
         }
         hotkeyManager.onTapDisabled = { [weak self] in
             self?.log("快捷键诊断: 事件监听被系统禁用，已重新启用")
@@ -209,6 +249,11 @@ final class AppState: ObservableObject {
         updateCrosshairModeStatus()
         Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.pollHdrState()
+        }
+        // 音量缓存：显示器自带的遥控器/按键也能改音量，定期回读一次，
+        // 避免下次按 Mac 音量键时从过期值起步。
+        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.refreshMediaVolumeState()
         }
         // 配了快捷键却没授权：启动时引导一次。
         // 系统授权框每个 app 只会弹一次，之后再调用是静默的，所以只在有快捷键配置时尝试。
@@ -466,6 +511,7 @@ final class AppState: ObservableObject {
                     self.check4KState()
                     // 原版连接后还会检测保活守护状态（QTimer 1800ms）
                     self.checkGuardian()
+                    self.refreshMediaVolumeState()
                 }
             } else {
                 DispatchQueue.main.async {
@@ -1939,6 +1985,21 @@ final class AppState: ObservableObject {
             hotkeyManager.registerRaw(id: HotkeyManager.mediaBrightnessDownID,
                                       keyCode: HotkeyManager.keyCodeBrightnessDown)
         }
+        if mediaVolumeKeysEnabled {
+            hotkeyManager.registerMedia(id: HotkeyManager.mediaVolumeUpID,
+                                        keyType: HotkeyManager.keyTypeVolumeUp)
+            hotkeyManager.registerMedia(id: HotkeyManager.mediaVolumeDownID,
+                                        keyType: HotkeyManager.keyTypeVolumeDown)
+            hotkeyManager.registerMedia(id: HotkeyManager.mediaMuteID,
+                                        keyType: HotkeyManager.keyTypeMute)
+            // 兼容「功能键当标准功能键」的系统设置（此时音量键发的是普通 keyDown）
+            hotkeyManager.registerRaw(id: HotkeyManager.mediaVolumeUpID,
+                                      keyCode: HotkeyManager.keyCodeVolumeUp)
+            hotkeyManager.registerRaw(id: HotkeyManager.mediaVolumeDownID,
+                                      keyCode: HotkeyManager.keyCodeVolumeDown)
+            hotkeyManager.registerRaw(id: HotkeyManager.mediaMuteID,
+                                      keyCode: HotkeyManager.keyCodeMute)
+        }
         let started = hotkeyManager.start()
         log("全局快捷键: 注册 \(hotkeyManager.bindingCount) 个"
             + (hotkeyManager.mediaBindingCount > 0 ? " + 媒体键 \(hotkeyManager.mediaBindingCount) 个" : "")
@@ -1955,6 +2016,19 @@ final class AppState: ObservableObject {
         }
         if id == HotkeyManager.mediaBrightnessDownID {
             adjustMediaBrightness(increase: false)
+            return
+        }
+        // 系统音量调节键：接管为显示器音量（仅当前音频输出匹配时）
+        if id == HotkeyManager.mediaVolumeUpID {
+            adjustMediaVolume(increase: true)
+            return
+        }
+        if id == HotkeyManager.mediaVolumeDownID {
+            adjustMediaVolume(increase: false)
+            return
+        }
+        if id == HotkeyManager.mediaMuteID {
+            toggleMediaMute()
             return
         }
         if id.hasPrefix("adjust:"), let idx = Int(id.dropFirst("adjust:".count)),
@@ -2208,6 +2282,160 @@ final class AppState: ObservableObject {
                          settingsKeys: ["picture_backlight", "xiaomi_picture_backlight"],
                          jniRampFrom: from) { [weak self] in
             self?.mediaBrightnessCommitInFlight = false
+        }
+    }
+
+    // MARK: - 音量调节键（绝对设置 + 停手后一次下发）
+
+    /// 音量预览值：连按/长按时拿它当基准；设备回读只在空闲时刷新，
+    /// 不会因为中间某次回读跳变把音量带回旧值。
+    private var mediaVolumePreview: Int?
+    /// 最近一次真正下发到设备的音量
+    private var mediaVolumeHardware: Int?
+    /// 设备当前是否静音（nil = 未知）
+    private var mediaVolumeMuted: Bool?
+    /// 连按期间出现过「静音状态下按音量键」，收尾时需要先解除静音
+    private var mediaVolumeNeedsUnmute = false
+    /// 待下发的收尾任务（尾部去抖）
+    private var mediaVolumeCommit: DispatchWorkItem?
+    /// 是否有一次下发正在跑
+    private var mediaVolumeCommitInFlight = false
+    /// 回退通道只提示一次，避免连按刷屏
+    private var mediaVolumeFallbackLogged = false
+
+    /// 收尾提交延迟：首次按下立即下发，这个延迟只决定连按中间值何时被合并。
+    private let mediaVolumeCommitDelay: TimeInterval = 0.12
+
+    /// 默认音频输出是否就是目标显示器 —— 音量键接管门。
+    /// 读不到输出设备时返回 false：宁可交给系统，也不要吞掉按键却没反应。
+    func shouldHandleNativeVolume() -> Bool {
+        guard mediaVolumeKeysEnabled, isConnected else { return false }
+        guard mediaVolumeOutputGateEnabled else { return true }
+        return AudioOutputMonitor.defaultOutputMatches(configuredName: mediaVolumeOutputName)
+    }
+
+    /// 空闲时回读一次音量/静音状态（连接后 + 每 5 秒）。
+    /// 连按/待下发期间跳过，避免把预览基准带偏。
+    func refreshMediaVolumeState() {
+        guard mediaVolumeKeysEnabled, isConnected else { return }
+        guard mediaVolumePreview == nil || mediaVolumePreview == mediaVolumeHardware else { return }
+        runBackground {
+            let volume = self.adb.mediaVolume()
+            let muted = self.adb.mediaMuted()
+            DispatchQueue.main.async {
+                guard self.mediaVolumeKeysEnabled, self.isConnected else { return }
+                if let volume {
+                    self.mediaVolumePreview = volume
+                    self.mediaVolumeHardware = volume
+                }
+                if let muted { self.mediaVolumeMuted = muted }
+            }
+        }
+    }
+
+    private func adjustMediaVolume(increase: Bool) {
+        guard isConnected else { return log("未连接") }
+        guard shouldHandleNativeVolume() else { return }
+
+        let base = mediaVolumePreview ?? mediaVolumeHardware ?? 50
+        let next: Int
+        if mediaVolumeNativeOSD {
+            // 系统 OSD 固定 16 格；开原生 OSD 时每按一次移动一格（和系统音量键一致）
+            let chiclets = NativeOSD.chicletCount
+            let chiclet = Int((Double(base) / 100 * Double(chiclets)).rounded())
+            let target = min(max(chiclet + (increase ? 1 : -1), 0), chiclets)
+            next = clamp(Int((Double(target) / Double(chiclets) * 100).rounded()), 0, 100)
+        } else {
+            let step = max(1, mediaVolumeStep)
+            next = clamp(AppState.alignToStep(base, step: step, increasing: increase), 0, 100)
+        }
+
+        // 静音时按音量键先解除静音（和 macOS/Android 原生行为一致）
+        if mediaVolumeMuted == true { mediaVolumeNeedsUnmute = true }
+        mediaVolumePreview = next
+        mediaVolumeMuted = false
+        currentValues["volume_music_speaker"] = String(next)
+
+        if mediaVolumeNativeOSD, NativeOSD.shared.showVolume(value: next) {
+            // 原生 OSD 自带淡出，不需要收尾
+        } else {
+            HUDWindow.shared.show(title: "音量", value: "\(next)")
+        }
+
+        // 首次按下立即下发；之后连按只更新预览，由收尾任务合并成最后一次
+        if !mediaVolumeCommitInFlight, mediaVolumeCommit == nil {
+            commitMediaVolume()
+        }
+        scheduleMediaVolumeTrailing()
+    }
+
+    /// 安排收尾提交；若那时还有下发在跑，就顺延到它结束。
+    private func scheduleMediaVolumeTrailing() {
+        mediaVolumeCommit?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.mediaVolumeCommitInFlight {
+                self.scheduleMediaVolumeTrailing()
+                return
+            }
+            self.mediaVolumeCommit = nil
+            self.commitMediaVolume()
+        }
+        mediaVolumeCommit = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + mediaVolumeCommitDelay, execute: work)
+    }
+
+    /// 把当前预览值绝对写到设备。目标值和已下发值相同时跳过，避免空跑一次。
+    private func commitMediaVolume() {
+        guard isConnected, let value = mediaVolumePreview else { return }
+        let unmute = mediaVolumeNeedsUnmute
+        guard mediaVolumeHardware != value || unmute else { return }
+        mediaVolumeNeedsUnmute = false
+        mediaVolumeCommitInFlight = true
+        runBackground {
+            let usedBinder = self.adb.setMediaVolume(value, unmuteFirst: unmute)
+            DispatchQueue.main.async {
+                self.mediaVolumeHardware = value
+                self.mediaVolumeCommitInFlight = false
+                if !usedBinder, !self.mediaVolumeFallbackLogged {
+                    self.mediaVolumeFallbackLogged = true
+                    self.log("音量键: AudioService binder 不可用，已回退 input keyevent")
+                }
+            }
+        }
+    }
+
+    private func toggleMediaMute() {
+        guard isConnected else { return log("未连接") }
+        guard shouldHandleNativeVolume() else { return }
+        if let known = mediaVolumeMuted {
+            applyMediaMute(!known)
+        } else {
+            // 状态未知（刚连接/被外部改过）：先回读再切换
+            runBackground {
+                let current = self.adb.mediaMuted() ?? false
+                DispatchQueue.main.async { self.applyMediaMute(!current) }
+            }
+        }
+    }
+
+    private func applyMediaMute(_ muted: Bool) {
+        mediaVolumeMuted = muted
+        // 更新的静音动作覆盖掉「按键先解除静音」的意图，避免收尾提交把它又打开
+        mediaVolumeNeedsUnmute = false
+        if mediaVolumeNativeOSD, NativeOSD.shared.showMute() {
+            // 原生静音 OSD
+        } else {
+            HUDWindow.shared.show(title: "静音", value: muted ? "开" : "关")
+        }
+        runBackground {
+            let usedBinder = self.adb.setMediaMuted(muted)
+            DispatchQueue.main.async {
+                if !usedBinder, !self.mediaVolumeFallbackLogged {
+                    self.mediaVolumeFallbackLogged = true
+                    self.log("静音键: AudioService binder 不可用，已回退 input keyevent")
+                }
+            }
         }
     }
 

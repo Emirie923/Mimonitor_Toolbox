@@ -52,5 +52,56 @@ final class MediaKeyTests: XCTestCase {
         XCTAssertNil(HotkeyManager.mediaKeyType(forKeyCode: 120))
         XCTAssertNil(HotkeyManager.mediaKeyType(forKeyCode: 0))
     }
+
+    // MARK: 音量键（NX_KEYTYPE 0/1/7）
+
+    func testVolumeUpKeyDown() {
+        let parsed = HotkeyManager.parseMediaKey(data1: data1(keyType: 0, down: true))
+        XCTAssertEqual(parsed.keyType, HotkeyManager.keyTypeVolumeUp)
+        XCTAssertTrue(parsed.isDown)
+    }
+
+    func testVolumeDownKeyDown() {
+        let parsed = HotkeyManager.parseMediaKey(data1: data1(keyType: 1, down: true))
+        XCTAssertEqual(parsed.keyType, HotkeyManager.keyTypeVolumeDown)
+        XCTAssertTrue(parsed.isDown)
+    }
+
+    func testMuteKeyDown() {
+        let parsed = HotkeyManager.parseMediaKey(data1: data1(keyType: 7, down: true))
+        XCTAssertEqual(parsed.keyType, HotkeyManager.keyTypeMute)
+        XCTAssertTrue(parsed.isDown)
+    }
+
+    func testVolumeKeyTypesAreClassified() {
+        XCTAssertTrue(HotkeyManager.isVolumeKeyType(HotkeyManager.keyTypeVolumeUp))
+        XCTAssertTrue(HotkeyManager.isVolumeKeyType(HotkeyManager.keyTypeVolumeDown))
+        XCTAssertTrue(HotkeyManager.isVolumeKeyType(HotkeyManager.keyTypeMute))
+        XCTAssertFalse(HotkeyManager.isVolumeKeyType(HotkeyManager.keyTypeBrightnessUp))
+        XCTAssertFalse(HotkeyManager.isVolumeKeyType(HotkeyManager.keyTypeBrightnessDown))
+        XCTAssertFalse(HotkeyManager.isVolumeKeyType(10))   // NX_KEYTYPE_NEXT
+    }
+
+    func testBrightnessKeyTypesAreClassified() {
+        XCTAssertTrue(HotkeyManager.isBrightnessKeyType(HotkeyManager.keyTypeBrightnessUp))
+        XCTAssertTrue(HotkeyManager.isBrightnessKeyType(HotkeyManager.keyTypeBrightnessDown))
+        XCTAssertFalse(HotkeyManager.isBrightnessKeyType(HotkeyManager.keyTypeVolumeUp))
+        XCTAssertFalse(HotkeyManager.isBrightnessKeyType(HotkeyManager.keyTypeMute))
+    }
+
+    // MARK: 音量键以普通 keyDown 到达（keyCode 72/73/74）
+
+    func testKeyDownVolumeKeys() {
+        XCTAssertEqual(HotkeyManager.mediaKeyType(forKeyCode: 72), HotkeyManager.keyTypeVolumeUp)
+        XCTAssertEqual(HotkeyManager.mediaKeyType(forKeyCode: 73), HotkeyManager.keyTypeVolumeDown)
+        XCTAssertEqual(HotkeyManager.mediaKeyType(forKeyCode: 74), HotkeyManager.keyTypeMute)
+    }
+
+    func testFunctionKeysAreNotVolumeKeys() {
+        // F10 / F11 / F12 走裸键绑定，不在媒体键映射里
+        XCTAssertNil(HotkeyManager.mediaKeyType(forKeyCode: 109))
+        XCTAssertNil(HotkeyManager.mediaKeyType(forKeyCode: 103))
+        XCTAssertNil(HotkeyManager.mediaKeyType(forKeyCode: 111))
+    }
 }
 #endif

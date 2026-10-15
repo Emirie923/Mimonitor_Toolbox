@@ -25,9 +25,11 @@ protocol OSDUIHelperProtocol {
 final class NativeOSD {
     static let shared = NativeOSD()
 
-    /// OSDImage.brightness
+    /// OSDImage.brightness / volume / mute
     private static let brightnessImage: Int64 = 1
-    /// 原生亮度 OSD 的格子数（系统亮度条就是 16 格）
+    private static let volumeImage: Int64 = 3
+    private static let muteImage: Int64 = 4
+    /// 原生亮度 / 音量 OSD 的格子数（系统条就是 16 格）
     static let chicletCount = 16
 
     private var connection: NSXPCConnection?
@@ -38,10 +40,37 @@ final class NativeOSD {
     /// 显示亮度 OSD。`value` / `maxValue` 决定亮几格。返回是否成功投递。
     @discardableResult
     func showBrightness(value: Int, maxValue: Int = 100, displayID: CGDirectDisplayID? = nil) -> Bool {
+        showImage(Self.brightnessImage, value: value, maxValue: maxValue, displayID: displayID)
+    }
+
+    /// 显示音量 OSD。和按系统音量键弹出的是同一条（16 格 + 喇叭图标）；
+    /// 音量为 0 时和系统一样换成静音图标。
+    @discardableResult
+    func showVolume(value: Int, maxValue: Int = 100, displayID: CGDirectDisplayID? = nil) -> Bool {
+        let image = value <= 0 ? Self.muteImage : Self.volumeImage
+        return showImage(image, value: value, maxValue: maxValue, displayID: displayID)
+    }
+
+    /// 显示静音 OSD（喇叭加斜线），对应系统静音键的提示。
+    @discardableResult
+    func showMute(displayID: CGDirectDisplayID? = nil) -> Bool {
+        guard let helper = helper() else { return false }
+        helper.showImage(Self.muteImage,
+                         onDisplayID: UInt32(displayID ?? Self.preferredDisplayID()),
+                         priority: 0x1F4,
+                         msecUntilFade: 1000,
+                         filledChiclets: 0,
+                         totalChiclets: UInt32(Self.chicletCount),
+                         locked: false)
+        return true
+    }
+
+    private func showImage(_ image: Int64, value: Int, maxValue: Int,
+                           displayID: CGDirectDisplayID?) -> Bool {
         guard let helper = helper() else { return false }
         let clamped = min(max(0, value), maxValue)
         let filled = UInt32((Double(clamped) / Double(max(1, maxValue)) * Double(Self.chicletCount)).rounded())
-        helper.showImage(Self.brightnessImage,
+        helper.showImage(image,
                          onDisplayID: UInt32(displayID ?? Self.preferredDisplayID()),
                          priority: 0x1F4,
                          msecUntilFade: 1000,
