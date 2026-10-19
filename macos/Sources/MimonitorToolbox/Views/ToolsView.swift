@@ -255,8 +255,10 @@ struct ToolsView: View {
 
     private func adjustBinding(_ index: Int) -> Binding<AdjustHotkeyConfig> {
         Binding(
-            get: { state.adjustHotkeys[index] },
-            set: { state.adjustHotkeys[index] = $0 }
+            // 删除行时 SwiftUI 可能还会短暂持有旧下标的 binding，越界要兜住，
+            // 否则会 "Index out of range" 直接 SIGTRAP（崩溃日志里出现过）。
+            get: { index < state.adjustHotkeys.count ? state.adjustHotkeys[index] : AdjustHotkeyConfig() },
+            set: { if index < state.adjustHotkeys.count { state.adjustHotkeys[index] = $0 } }
         )
     }
 }
@@ -295,6 +297,91 @@ struct HotkeyConfigSheet: View {
                     Button("新建可调快捷键") {
                         state.adjustHotkeys.append(AdjustHotkeyConfig())
                     }
+
+                    Divider().padding(.vertical, 4)
+
+                    // 系统亮度调节键直接接管为显示器背光。
+                    // 这类键可能以 NX_SYSDEFINED 或普通 keyDown(144/145) 到达，都要拦。
+                    HStack(spacing: 12) {
+                        Toggle("亮度调节键调显示器背光", isOn: $state.mediaBrightnessKeysEnabled)
+                            .toggleStyle(.checkbox)
+                        // 开原生 OSD 时步长固定 16 格，整个隐藏，别留一个灰着的「步长 10」
+                        if !state.mediaBrightnessNativeOSD {
+                            Stepper("步长 \(state.mediaBrightnessStep)", value: $state.mediaBrightnessStep, in: 1...100)
+                                .frame(width: 140)
+                                .disabled(!state.mediaBrightnessKeysEnabled)
+                        }
+                        Spacer()
+                    }
+                    Text("开启后系统亮度调节键被本应用接管：调暗键减小、调亮键增大显示器背光，内置屏幕不再变亮。需辅助功能权限，且已连接显示器。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle("使用 macOS 原生亮度提示（OSD）", isOn: $state.mediaBrightnessNativeOSD)
+                        .toggleStyle(.checkbox)
+                        .disabled(!state.mediaBrightnessKeysEnabled)
+                    Text(state.mediaBrightnessNativeOSD
+                         ? "开启后按亮度键弹出系统原生亮度条（与系统亮度键同款），固定 16 格、每按一次一格，步长不可调。"
+                         : "开启后按亮度键弹出系统原生亮度条；关掉则用本应用的悬浮提示。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle("多屏时仅在鼠标位于「\(state.mediaBrightnessDisplayName)」时拦截", isOn: $state.mediaBrightnessFocusOnly)
+                        .toggleStyle(.checkbox)
+                        .disabled(!state.mediaBrightnessKeysEnabled)
+                    HStack(spacing: 8) {
+                        Text("显示器名称")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        TextField("Mi Monitor", text: $state.mediaBrightnessDisplayName)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 200)
+                        Spacer()
+                    }
+                    .disabled(!state.mediaBrightnessKeysEnabled)
+                    Text("鼠标不在目标显示器上时，亮度键交回系统处理（去调内置屏亮度）。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Divider().padding(.vertical, 4)
+
+                    // 系统音量调节键接管为显示器音量。
+                    HStack(spacing: 12) {
+                        Toggle("音量调节键调显示器音量", isOn: $state.mediaVolumeKeysEnabled)
+                            .toggleStyle(.checkbox)
+                        if !state.mediaVolumeNativeOSD {
+                            Stepper("步长 \(state.mediaVolumeStep)", value: $state.mediaVolumeStep, in: 1...100)
+                                .frame(width: 140)
+                                .disabled(!state.mediaVolumeKeysEnabled)
+                        }
+                        Spacer()
+                    }
+                    Text("开启后音量加减键、静音键接管为显示器音量（0~100，一次一格）；仅在默认音频输出匹配下方设备时生效，其余情况交回系统。需辅助功能权限，且已连接显示器。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle("使用 macOS 原生音量提示（OSD）", isOn: $state.mediaVolumeNativeOSD)
+                        .toggleStyle(.checkbox)
+                        .disabled(!state.mediaVolumeKeysEnabled)
+                    Text(state.mediaVolumeNativeOSD
+                         ? "开启后按音量键弹出系统原生音量条（与系统音量键同款）；失败自动回退本应用悬浮提示。"
+                         : "开启后按音量键弹出系统原生音量条；关掉则用本应用的悬浮提示。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle("仅当默认音频输出为指定设备时接管", isOn: $state.mediaVolumeOutputGateEnabled)
+                        .toggleStyle(.checkbox)
+                        .disabled(!state.mediaVolumeKeysEnabled)
+                    HStack(spacing: 8) {
+                        Text("音频输出设备名")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        TextField("Mi Monitor", text: $state.mediaVolumeOutputName)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 200)
+                        Spacer()
+                    }
+                    .disabled(!state.mediaVolumeKeysEnabled || !state.mediaVolumeOutputGateEnabled)
                 }
                 .padding(16)
             }
@@ -336,8 +423,8 @@ struct HotkeyConfigSheet: View {
 
     private func adjustBinding(_ index: Int) -> Binding<AdjustHotkeyConfig> {
         Binding(
-            get: { state.adjustHotkeys[index] },
-            set: { state.adjustHotkeys[index] = $0 }
+            get: { index < state.adjustHotkeys.count ? state.adjustHotkeys[index] : AdjustHotkeyConfig() },
+            set: { if index < state.adjustHotkeys.count { state.adjustHotkeys[index] = $0 } }
         )
     }
 }

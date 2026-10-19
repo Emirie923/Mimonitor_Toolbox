@@ -37,9 +37,16 @@ openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
     -addext "extendedKeyUsage=critical,codeSigning" 2>/dev/null
 
 echo "==> 2/3 导入登录钥匙串..."
-openssl pkcs12 -export -out "$TMP/cert.p12" \
-    -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
-    -passout pass:mimonitor -name "$CERT_NAME" 2>/dev/null
+# OpenSSL 3+/4 默认用 AES-256 + SHA-256 保护 p12，macOS 的 security import 会报
+# "MAC verification failed during PKCS12 import (wrong password?)"—— 其实密码没错，
+# 是算法不兼容。优先用 -legacy 生成兼容格式；老版本 OpenSSL（没有 -legacy）再退回默认。
+if ! openssl pkcs12 -export -out "$TMP/cert.p12" \
+        -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
+        -passout pass:mimonitor -name "$CERT_NAME" -legacy 2>/dev/null; then
+    openssl pkcs12 -export -out "$TMP/cert.p12" \
+        -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
+        -passout pass:mimonitor -name "$CERT_NAME" 2>/dev/null
+fi
 
 security import "$TMP/cert.p12" -k "$KEYCHAIN" -P mimonitor \
     -T /usr/bin/codesign -T /usr/bin/security >/dev/null

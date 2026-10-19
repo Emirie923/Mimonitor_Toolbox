@@ -367,8 +367,157 @@ final class AdbClient {
         shell("settings put global \(key) \(value)")
     }
 
+    /// 一次 shell 写多个 settings，省掉每条一次 ADB 往返。
+    func settingsPutBatch(_ pairs: [(String, String)]) {
+        guard !pairs.isEmpty else { return }
+        shell(pairs.map { "settings put global \($0.0) \($0.1)" }.joined(separator: "; "))
+    }
+
     func keyevent(_ code: String) {
         shell("input keyevent \(code)")
+    }
+
+    // MARK: - 音量 / 静音
+
+    /// `service call audio` 的 transaction code（AIDL 常量，和系统版本绑定）。
+    ///
+    /// 这台显示器（MiTV-MFFU1 / Android 14）上，`cmd media_session volume --set` 会被
+    /// AudioService 拒掉 —— 它把 callingPackage 写死成 `com.android.server.media`，
+    /// 而 AppOps 的包名/uid 校验过不了（该包不属于 shell uid 2000）。
+    /// `settings put system volume_music_speaker` 也不会触发 AudioService（没有观察者）。
+    /// 唯一能做「绝对设置」的就是直接调 binder：一次调用、没有 `input keyevent`
+    /// 逐级发送的 ~100ms/级延迟，也不会在显示器上闪一串音量条。
+    enum AudioServiceTxn {
+        /// adjustStreamVolume(int streamType, int direction, int flags, String package)
+        static let adjustStreamVolume = 10
+        /// setStreamVolume(int streamType, int index, int flags, String package)
+        static let setStreamVolume = 12
+        /// isStreamMute(int streamType) -> boolean
+        static let isStreamMute = 17
+        /// getStreamVolumeForMute(int streamType) -> int
+        static let getStreamVolumeForMute = 22
+    }
+    /// AudioManager.STREAM_MUSIC
+    static let streamMusic = 3
+    /// AudioManager.ADJUST_MUTE / ADJUST_UNMUTE（hidden API 常量）
+    static let adjustMute = -100
+    static let adjustUnmute = 100
+    /// 调用方包名必须属于 shell uid，否则 AudioService 的 AppOps 校验会抛 SecurityException。
+    static let binderShellPackage = "com.android.shell"
+
+    /// nil = 尚未验证 binder 通道；true/false = 验证结果。
+    /// 只在第一次写音量/静音时回读确认 transaction code 没被 ROM 改掉。
+    private var mediaVolumeBinderVerified: Bool?
+
+    /// 读取媒体音量（0~100）。
+    ///
+    /// 优先走 binder 的 `getStreamVolumeForMute`：
+    ///   - `getStreamVolume` 在静音时会返回 0，会把静音前的音量弄丢；
+    ///   - `settings get system volume_music_speaker` 在刚写完的 ~1 秒内还是旧值
+    ///     （Settings 落盘/缓存有延迟），拿它做回读校验会被坑到。
+    /// txn 不可用时回退 settings。
+    func mediaVolume() -> Int? {
+        let output = shell("service call audio \(AudioServiceTxn.getStreamVolumeForMute) i32 \(Self.streamMusic)")
+        if let value = Self.parseServiceCallInt(output), (0...100).contains(value) {
+            return value
+        }
+        let raw = shell("settings get system volume_music_speaker")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Int(raw)
+    }
+
+    /// 媒体流当前是否静音。
+    func mediaMuted() -> Bool? {
+        let output = shell("service call audio \(AudioServiceTxn.isStreamMute) i32 \(Self.streamMusic)")
+        guard let value = Self.parseServiceCallInt(output) else { return nil }
+        return value != 0
+    }
+
+    /// 绝对设置媒体音量（0~100）。返回是否走了 binder 快速通道。
+    /// binder 不可用时退回 `input keyevent` 逐级调整（先读当前值再补差值）。
+    @discardableResult
+    func setMediaVolume(_ value: Int, unmuteFirst: Bool = false) -> Bool {
+        let target = max(0, min(100, value))
+        if unmuteFirst { _ = setMediaMuted(false) }
+        if mediaVolumeBinderVerified != false {
+            let output = shell("service call audio \(AudioServiceTxn.setStreamVolume) i32 \(Self.streamMusic) i32 \(target) i32 0 s16 \(Self.binderShellPackage)")
+            if Self.serviceCallSucceeded(output) {
+                if mediaVolumeBinderVerified == nil {
+                    // 首次调用回读确认真的生效：ROM 若改了 transaction code，
+                    // service call 也可能"成功"地调到了别的方法。
+                    let applied = mediaVolume() == target
+                    mediaVolumeBinderVerified = applied
+                    if applied { return true }
+                } else {
+                    return true
+                }
+            } else {
+                mediaVolumeBinderVerified = false
+            }
+        }
+        applyMediaVolumeByKeyEvent(target)
+        return false
+    }
+
+    /// 设置/解除媒体流静音。返回是否走了 binder 快速通道。
+    @discardableResult
+    func setMediaMuted(_ muted: Bool) -> Bool {
+        if mediaVolumeBinderVerified != false {
+            let direction = muted ? Self.adjustMute : Self.adjustUnmute
+            let output = shell("service call audio \(AudioServiceTxn.adjustStreamVolume) i32 \(Self.streamMusic) i32 \(direction) i32 0 s16 \(Self.binderShellPackage)")
+            if Self.serviceCallSucceeded(output) {
+                if mediaVolumeBinderVerified == nil {
+                    let applied = mediaMuted() == muted
+                    mediaVolumeBinderVerified = applied
+                    if applied { return true }
+                } else {
+                    return true
+                }
+            } else {
+                mediaVolumeBinderVerified = false
+            }
+        }
+        // keyevent 的静音键是 toggle：调用方刚把目标状态算成当前状态的反面，正好对上。
+        shell("input keyevent KEYCODE_VOLUME_MUTE")
+        return false
+    }
+
+    /// binder 不可用时的退路：先读当前值，再用 `input keyevent` 逐级补齐差值。
+    private func applyMediaVolumeByKeyEvent(_ target: Int) {
+        guard let current = mediaVolume() else { return }
+        let delta = target - current
+        guard delta != 0 else { return }
+        let key = delta > 0 ? "KEYCODE_VOLUME_UP" : "KEYCODE_VOLUME_DOWN"
+        let batch = Array(repeating: key, count: min(abs(delta), 100)).joined(separator: " ")
+        shell("input keyevent \(batch)")
+    }
+
+    /// `service call` 是否执行成功（没有 binder 异常）。抽出来方便单测。
+    static func serviceCallSucceeded(_ output: String) -> Bool {
+        guard output.contains("Result: Parcel(") else { return false }
+        let lower = output.lowercased()
+        return !lower.contains("error") && !lower.contains("exception")
+    }
+
+    /// 从 `service call` 输出里取返回的 int —— Parcel dump 里最后一个 8 位十六进制词。
+    /// 形如 `Result: Parcel(\t00000000 00000018   '........')` → 24。
+    /// 第一个词是 binder 的异常码，所以至少要有两个词才算真的带返回值；
+    /// void 方法（只有一个异常码）返回 nil，避免被当成值 0。抽出来方便单测。
+    static func parseServiceCallInt(_ output: String) -> Int? {
+        let hexDigits = Set("0123456789abcdefABCDEF")
+        var tokens: [String] = []
+        var current = ""
+        for character in output {
+            if hexDigits.contains(character) {
+                current.append(character)
+            } else {
+                if current.count == 8 { tokens.append(current) }
+                current = ""
+            }
+        }
+        if current.count == 8 { tokens.append(current) }
+        guard tokens.count >= 2, let last = tokens.last, let value = Int(last, radix: 16) else { return nil }
+        return value
     }
 
     func refreshPq() {
@@ -399,6 +548,31 @@ final class AdbClient {
     func jniSet(key: String, value: String, upd: Int = 3) {
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "set", key, value, String(upd)]))
+    }
+
+    /// 平滑渐变：在显示器端把 key 从 from 推到 to，跑完后再落 settings。
+    /// 显示器自带的亮度键就是这样一小步一小步走的；单次大步长会让面板过冲、看起来像闪。
+    /// `from` 由 App 侧的粘性预览链给出，刻意不回读设备 —— JNI 回读值偶发跳变会把起点带偏。
+    ///
+    /// 默认 `stepMs = 0`（不等、最快），步长 `step` 由调用方按 delta 算，
+    /// 把总步数压在十几步内，避免长按后旧的渐变拖很久、把后续点按都堵在后面。
+    ///
+    /// settings 必须等渐变结束再写：`picture_backlight` 的 ContentObserver 会直接改硬件，
+    /// 提前写会把画面一下拉到目标值（先闪到目标、再被渐变拉回起点，观感就是来回闪）。
+    /// 这里在设备侧用一个等待循环等渐变写完成标记，再执行 `settings put`。
+    func jniRamp(key: String, from: Int, to: Int, settingsKeys: [String] = [],
+                 upd: Int = 3, stepMs: Int = 0, step: Int = 1) {
+        let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
+        let dir = "/sdcard/Download/Mimonitor_Toolbox"
+        let done = "\(dir)/.mtk_ramp_done"
+        let ramp = buildTvserviceCommand(jar: jar, args: [
+            "MtkDirectTool", "ramp", key, String(from), String(to), String(upd),
+            String(stepMs), done, String(step)
+        ])
+        var parts = ["mkdir -p \(dir)", "rm -f \(done)", "\(ramp) >/dev/null"]
+        parts.append("i=0; while [ $i -lt 80 ] && [ ! -f \(done) ]; do sleep 0.1; i=$((i+1)); done")
+        parts.append(contentsOf: settingsKeys.map { "settings put global \($0) \(to)" })
+        shell(parts.joined(separator: "; "))
     }
 
     func hdrToneMapping(_ value: String, upd: Int = 3) {

@@ -124,6 +124,72 @@ final class AppState: ObservableObject {
     @Published var hotkeys: [String: HotkeyConfig] = AppState.loadHotkeys()
     @Published var adjustHotkeys: [AdjustHotkeyConfig] = AppState.loadAdjustHotkeys()
 
+    /// 是否把系统亮度调节键接管为显示器背光调节。
+    /// 开启后 HotkeyManager 会吞掉系统亮度调节键事件，内置屏幕不再跟着变。
+    @Published var mediaBrightnessKeysEnabled = UserDefaults.standard.bool(forKey: "media_brightness_keys_enabled") {
+        didSet {
+            UserDefaults.standard.set(mediaBrightnessKeysEnabled, forKey: "media_brightness_keys_enabled")
+            applyHotkeys()
+            if mediaBrightnessKeysEnabled, !HotkeyManager.isTrusted {
+                HotkeyManager.requestAccessibility()
+            }
+        }
+    }
+
+    /// 亮度调节键每按一次的背光步长
+    @Published var mediaBrightnessStep = UserDefaults.standard.object(forKey: "media_brightness_step") as? Int ?? 5 {
+        didSet { UserDefaults.standard.set(mediaBrightnessStep, forKey: "media_brightness_step") }
+    }
+
+    /// 亮度调节键是否显示 macOS 原生亮度 OSD（而不是本应用 HUD）。
+    /// 走私有 OSDUIHelper，失败会自动回退到 HUD。
+    @Published var mediaBrightnessNativeOSD = UserDefaults.standard.object(forKey: "media_brightness_native_osd") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(mediaBrightnessNativeOSD, forKey: "media_brightness_native_osd") }
+    }
+
+    /// 多屏时是否只在焦点位于目标显示器上才拦截亮度键；焦点不在时就交回系统。
+    @Published var mediaBrightnessFocusOnly = UserDefaults.standard.object(forKey: "media_brightness_focus_only") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(mediaBrightnessFocusOnly, forKey: "media_brightness_focus_only") }
+    }
+
+    /// 目标显示器的系统名称（用于多屏焦点判断），默认按 EDID 名 "Mi Monitor"。
+    @Published var mediaBrightnessDisplayName = UserDefaults.standard.string(forKey: "media_brightness_display_name") ?? "Mi Monitor" {
+        didSet { UserDefaults.standard.set(mediaBrightnessDisplayName, forKey: "media_brightness_display_name") }
+    }
+
+    /// 是否把系统音量调节键接管为显示器音量。
+    /// 只在「当前默认音频输出匹配目标设备」时生效，否则交回系统去调内置扬声器/AirPods。
+    @Published var mediaVolumeKeysEnabled = UserDefaults.standard.bool(forKey: "media_volume_keys_enabled") {
+        didSet {
+            UserDefaults.standard.set(mediaVolumeKeysEnabled, forKey: "media_volume_keys_enabled")
+            applyHotkeys()
+            if mediaVolumeKeysEnabled {
+                if !HotkeyManager.isTrusted { HotkeyManager.requestAccessibility() }
+                refreshMediaVolumeState()
+            }
+        }
+    }
+
+    /// 关掉原生音量 OSD 时，每按一次的音量步长
+    @Published var mediaVolumeStep = UserDefaults.standard.object(forKey: "media_volume_step") as? Int ?? 5 {
+        didSet { UserDefaults.standard.set(mediaVolumeStep, forKey: "media_volume_step") }
+    }
+
+    /// 音量键是否显示 macOS 原生音量 OSD（走私有 OSDUIHelper，失败回退本应用 HUD）。
+    @Published var mediaVolumeNativeOSD = UserDefaults.standard.object(forKey: "media_volume_native_osd") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(mediaVolumeNativeOSD, forKey: "media_volume_native_osd") }
+    }
+
+    /// 是否只在默认音频输出匹配指定名称时才接管音量键
+    @Published var mediaVolumeOutputGateEnabled = UserDefaults.standard.object(forKey: "media_volume_output_gate") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(mediaVolumeOutputGateEnabled, forKey: "media_volume_output_gate") }
+    }
+
+    /// 目标音频输出设备名（CoreAudio 设备名，匹配用「包含」）
+    @Published var mediaVolumeOutputName = UserDefaults.standard.string(forKey: "media_volume_output_name") ?? "Mi Monitor" {
+        didSet { UserDefaults.standard.set(mediaVolumeOutputName, forKey: "media_volume_output_name") }
+    }
+
     private var hdrLastState: Bool?
     private var logFileHandle: FileHandle?
     private var logFileURL: URL?
@@ -157,6 +223,22 @@ final class AppState: ObservableObject {
             guard let self, self.hotkeyDebugEnabled else { return }
             self.log("快捷键诊断: 按键码 \(code) 命中，但修饰键不符（实收 \(flags.rawValue) / 期望 \(expected.rawValue)）")
         }
+        // 亮度/音量这类系统媒体键的诊断。用来区分「系统没发事件」和「解析没命中」。
+        hotkeyManager.onMediaKeyEvent = { [weak self] keyType, isDown in
+            guard let self, self.hotkeyDebugEnabled else { return }
+            self.log("媒体键诊断: 类型 \(keyType) \(isDown ? "按下" : "抬起")")
+        }
+        // 媒体键拦截门：亮度键看多屏焦点，音量键看当前默认音频输出，其余一律放行。
+        hotkeyManager.shouldHandleMediaKey = { [weak self] keyType in
+            guard let self else { return true }
+            if HotkeyManager.isBrightnessKeyType(keyType) {
+                return self.shouldHandleMediaBrightnessForFocus()
+            }
+            if HotkeyManager.isVolumeKeyType(keyType) {
+                return self.shouldHandleNativeVolume()
+            }
+            return false
+        }
         hotkeyManager.onTapDisabled = { [weak self] in
             self?.log("快捷键诊断: 事件监听被系统禁用，已重新启用")
         }
@@ -167,6 +249,11 @@ final class AppState: ObservableObject {
         updateCrosshairModeStatus()
         Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.pollHdrState()
+        }
+        // 音量缓存：显示器自带的遥控器/按键也能改音量，定期回读一次，
+        // 避免下次按 Mac 音量键时从过期值起步。
+        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.refreshMediaVolumeState()
         }
         // 配了快捷键却没授权：启动时引导一次。
         // 系统授权框每个 app 只会弹一次，之后再调用是静默的，所以只在有快捷键配置时尝试。
@@ -424,6 +511,7 @@ final class AppState: ObservableObject {
                     self.check4KState()
                     // 原版连接后还会检测保活守护状态（QTimer 1800ms）
                     self.checkGuardian()
+                    self.refreshMediaVolumeState()
                 }
             } else {
                 DispatchQueue.main.async {
@@ -786,16 +874,39 @@ final class AppState: ObservableObject {
     }
 
     /// 通用滑条：写 JNI + settings，然后 refresh_pq。
-    func setPictureSlider(title: String, value: Int, jniKey: String?, settingsKeys: [String]) {
-        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
-        guard isConnected else { return log("未连接") }
+    /// `jniRampFrom` 非空时改用显示器端渐变（见 `jniRamp`）——亮度键走这条，避免大步长过冲。
+    func setPictureSlider(title: String, value: Int, jniKey: String?, settingsKeys: [String],
+                          jniRampFrom: Int? = nil, completion: (() -> Void)? = nil) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { completion?(); return }
+        guard isConnected else { log("未连接"); completion?(); return }
+        // 背光：同步本地预览。媒体键下次拿它当基准，不会被刷新回读到的 JNI 值带偏
+        // （那个值偶发会跳，表现就是亮度先冲高再回落）。同时记住已下发到硬件的值，供下次渐变当起点。
+        if jniKey == "g_disp__disp_back_light" {
+            mediaBrightnessPreview = value
+            mediaBrightnessHardware = value
+        }
         log("\(title): \(value)")
-        runPictureChange {
-            if let jniKey {
-                self.adb.jniSet(key: jniKey, value: String(value))
-                self.adb.refreshPq()
+        runPictureChange(completion: completion) {
+            if let jniKey, let jniRampFrom {
+                // 渐变：显示器端按 step 推进；等它跑完再由设备侧写 settings。
+                // settings 观察者会直接改硬件，所以必须等渐变结束再写（此时硬件已在目标值，
+                // 再套用一次等于空操作），否则会先把画面拉到目标值、把渐变打断。
+                // 单格亮度变化约为 6–7%，不必按 1% 拆成多次 JNI 写入；
+                // 更大的变化仍保留渐变，并把总步数压到 ~16 步内。
+                let delta = abs(value - jniRampFrom)
+                let oneChiclet = Int(ceil(100.0 / Double(NativeOSD.chicletCount)))
+                let isOneChiclet = delta <= oneChiclet
+                let step = isOneChiclet ? max(1, delta) : max(1, Int(ceil(Double(delta) / 16.0)))
+                let rampFrom = isOneChiclet ? value : jniRampFrom
+                self.adb.jniRamp(key: jniKey, from: rampFrom, to: value,
+                                 settingsKeys: settingsKeys, step: step)
+            } else {
+                if let jniKey {
+                    self.adb.jniSet(key: jniKey, value: String(value))
+                    self.adb.refreshPq()
+                }
+                self.adb.settingsPutBatch(settingsKeys.map { ($0, String(value)) })
             }
-            for k in settingsKeys { self.adb.settingsPut(k, String(value)) }
         }
     }
 
@@ -1863,14 +1974,63 @@ final class AppState: ObservableObject {
         for (idx, rule) in adjustHotkeys.enumerated() where rule.isEnabled {
             hotkeyManager.register(id: "adjust:\(idx)", modifierName: rule.modifier, keyName: rule.key)
         }
+        if mediaBrightnessKeysEnabled {
+            hotkeyManager.registerMedia(id: HotkeyManager.mediaBrightnessUpID,
+                                        keyType: HotkeyManager.keyTypeBrightnessUp)
+            hotkeyManager.registerMedia(id: HotkeyManager.mediaBrightnessDownID,
+                                        keyType: HotkeyManager.keyTypeBrightnessDown)
+            // 兼容「功能键当标准功能键」的系统设置（此时亮度键发的是普通 keyDown）
+            hotkeyManager.registerRaw(id: HotkeyManager.mediaBrightnessUpID,
+                                      keyCode: HotkeyManager.keyCodeBrightnessUp)
+            hotkeyManager.registerRaw(id: HotkeyManager.mediaBrightnessDownID,
+                                      keyCode: HotkeyManager.keyCodeBrightnessDown)
+        }
+        if mediaVolumeKeysEnabled {
+            hotkeyManager.registerMedia(id: HotkeyManager.mediaVolumeUpID,
+                                        keyType: HotkeyManager.keyTypeVolumeUp)
+            hotkeyManager.registerMedia(id: HotkeyManager.mediaVolumeDownID,
+                                        keyType: HotkeyManager.keyTypeVolumeDown)
+            hotkeyManager.registerMedia(id: HotkeyManager.mediaMuteID,
+                                        keyType: HotkeyManager.keyTypeMute)
+            // 兼容「功能键当标准功能键」的系统设置（此时音量键发的是普通 keyDown）
+            hotkeyManager.registerRaw(id: HotkeyManager.mediaVolumeUpID,
+                                      keyCode: HotkeyManager.keyCodeVolumeUp)
+            hotkeyManager.registerRaw(id: HotkeyManager.mediaVolumeDownID,
+                                      keyCode: HotkeyManager.keyCodeVolumeDown)
+            hotkeyManager.registerRaw(id: HotkeyManager.mediaMuteID,
+                                      keyCode: HotkeyManager.keyCodeMute)
+        }
         let started = hotkeyManager.start()
-        log("全局快捷键: 注册 \(hotkeyManager.bindingCount) 个，"
-            + "监听\(started ? "已启动" : "启动失败")"
+        log("全局快捷键: 注册 \(hotkeyManager.bindingCount) 个"
+            + (hotkeyManager.mediaBindingCount > 0 ? " + 媒体键 \(hotkeyManager.mediaBindingCount) 个" : "")
+            + "，监听\(started ? "已启动" : "启动失败")"
             + "（辅助功能权限：\(HotkeyManager.isTrusted ? "已授予" : "未授予")）")
     }
 
     private func handleHotkeyTrigger(_ id: String) {
         guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
+        // 系统亮度调节键：固定调背光，立即反馈 + 串行化下发
+        if id == HotkeyManager.mediaBrightnessUpID {
+            adjustMediaBrightness(increase: true)
+            return
+        }
+        if id == HotkeyManager.mediaBrightnessDownID {
+            adjustMediaBrightness(increase: false)
+            return
+        }
+        // 系统音量调节键：接管为显示器音量（仅当前音频输出匹配时）
+        if id == HotkeyManager.mediaVolumeUpID {
+            adjustMediaVolume(increase: true)
+            return
+        }
+        if id == HotkeyManager.mediaVolumeDownID {
+            adjustMediaVolume(increase: false)
+            return
+        }
+        if id == HotkeyManager.mediaMuteID {
+            toggleMediaMute()
+            return
+        }
         if id.hasPrefix("adjust:"), let idx = Int(id.dropFirst("adjust:".count)),
            idx >= 0, idx < adjustHotkeys.count {
             let rule = adjustHotkeys[idx]
@@ -2025,9 +2185,293 @@ final class AppState: ObservableObject {
     private var adjustPendingValues: [String: Int] = [:]
     private var adjustPendingWork: [String: DispatchWorkItem] = [:]
 
+    /// 把值对齐到 `step` 的倍数：不在格点上时朝调整方向跳到最近的格点，
+    /// 已经在格点上就正常加减一个 step。例：值 6、步长 10、调亮 → 10；再按 → 20。
+    static func alignToStep(_ value: Int, step: Int, increasing: Bool) -> Int {
+        guard step > 1 else { return value + (increasing ? step : -step) }
+        if value % step == 0 { return value + (increasing ? step : -step) }
+        return increasing ? ((value / step) + 1) * step : (value / step) * step
+    }
+
     private func adjustHotkey(param: String, direction: String, step: Int) {
         let delta = direction == "decrease" ? -step : step
         applyAdjustment(param: param, delta: delta, absolute: nil)
+    }
+
+    // MARK: - 亮度调节键（立即反馈 + 停手后一次下发）
+
+    /// 亮度预览值：连按/长按时拿它当基准，必须「粘住」——中途去读设备回读值
+    /// 会拿到 refreshPq 后偶发跳变的 JNI 值，导致亮度来回跳。
+    /// 内部可见：预设应用在 AppState+Presets 里要清它。
+    var mediaBrightnessPreview: Int?
+    /// 最近一次真正下发到硬件的背光值；渐变以它为起点，连按时从设备真实位置平滑推进，
+    /// 不会因为「预览已加到 60、硬件还停在 50」而在起点先跳一大步。
+    var mediaBrightnessHardware: Int?
+    /// 待下发的收尾任务（尾部去抖）
+    private var mediaBrightnessCommit: DispatchWorkItem?
+    /// 是否有一次下发正在跑（设备队列里跑渐变 + 等完成信号，约 0.4s）
+    private var mediaBrightnessCommitInFlight = false
+
+    /// 收尾提交延迟：一段连按结束后多久补上最终值。首次按下是立即下发的，
+    /// 这个延迟只决定「连按过程中的中间值什么时候被合并掉」。
+    private let mediaBrightnessCommitDelay: TimeInterval = 0.12
+
+    private func adjustMediaBrightness(increase: Bool) {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete else { return }
+        guard isConnected else { return log("未连接") }
+        // 焦点不在目标显示器上时不处理（Hook 对 144/145 已经放过事件，这里再兜一层）
+        guard shouldHandleMediaBrightnessForFocus() else { return }
+
+        let current = mediaBrightnessPreview ?? intValue("picture_backlight", default: 50)
+        let next: Int
+        if mediaBrightnessNativeOSD {
+            // 系统 OSD 固定 16 格，按用户步长（如 10）会出现「一格 / 两格」乱跳，
+            // 所以开原生 OSD 时固定每按一次移动一格。
+            let chiclets = NativeOSD.chicletCount
+            let chiclet = Int((Double(current) / 100 * Double(chiclets)).rounded())
+            let target = min(max(chiclet + (increase ? 1 : -1), 0), chiclets)
+            next = clamp(Int((Double(target) / Double(chiclets) * 100).rounded()), 1, 100)
+        } else {
+            let step = max(1, mediaBrightnessStep)
+            next = clamp(AppState.alignToStep(current, step: step, increasing: increase), 1, 100)
+        }
+        mediaBrightnessPreview = next
+        currentValues["picture_backlight"] = String(next)
+
+        // 视觉反馈立刻跟上手（OSD/HUD 显示到目标值）
+        if mediaBrightnessNativeOSD, NativeOSD.shared.showBrightness(value: next) {
+            // 原生 OSD 自带淡出，不需要收尾
+        } else {
+            HUDWindow.shared.show(title: "背光", value: "\(next)")
+        }
+
+        // 首次按下立即下发：按键即响应，不等去抖。
+        // 之后连按只更新预览，由收尾任务在「当前下发完成」后再补一次最终值，
+        // 既不会堆积好几条渐变，也不会把第一次的响应拖到停手之后。
+        if !mediaBrightnessCommitInFlight, mediaBrightnessCommit == nil {
+            commitMediaBrightness()
+        }
+        scheduleMediaBrightnessTrailing()
+    }
+
+    /// 安排收尾提交：`mediaBrightnessCommitDelay` 内没有新按键才补；
+    /// 若那时还有下发在跑，就顺延到它结束，避免和进行中的渐变抢设备队列。
+    private func scheduleMediaBrightnessTrailing() {
+        mediaBrightnessCommit?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.mediaBrightnessCommitInFlight {
+                self.scheduleMediaBrightnessTrailing()
+                return
+            }
+            self.mediaBrightnessCommit = nil
+            self.commitMediaBrightness()
+        }
+        mediaBrightnessCommit = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + mediaBrightnessCommitDelay, execute: work)
+    }
+
+    /// 把当前预览值下发到显示器（渐变）。目标值和已下发值相同时跳过，避免空跑一次。
+    private func commitMediaBrightness() {
+        guard !isPresetBusy, !presetConfiguration.applicationIncomplete, isConnected else { return }
+        guard let value = mediaBrightnessPreview, mediaBrightnessHardware != value else { return }
+        // 从「已下发到硬件的值」出发做渐变；首次没有记录时以设备当前值为起点。
+        let from = mediaBrightnessHardware ?? intValue("picture_backlight", default: value)
+        mediaBrightnessCommitInFlight = true
+        setPictureSlider(title: "背光", value: value, jniKey: "g_disp__disp_back_light",
+                         settingsKeys: ["picture_backlight", "xiaomi_picture_backlight"],
+                         jniRampFrom: from) { [weak self] in
+            self?.mediaBrightnessCommitInFlight = false
+        }
+    }
+
+    // MARK: - 音量调节键（绝对设置 + 停手后一次下发）
+
+    /// 音量预览值：连按/长按时拿它当基准；设备回读只在空闲时刷新，
+    /// 不会因为中间某次回读跳变把音量带回旧值。
+    private var mediaVolumePreview: Int?
+    /// 最近一次真正下发到设备的音量
+    private var mediaVolumeHardware: Int?
+    /// 设备当前是否静音（nil = 未知）
+    private var mediaVolumeMuted: Bool?
+    /// 连按期间出现过「静音状态下按音量键」，收尾时需要先解除静音
+    private var mediaVolumeNeedsUnmute = false
+    /// 待下发的收尾任务（尾部去抖）
+    private var mediaVolumeCommit: DispatchWorkItem?
+    /// 是否有一次下发正在跑
+    private var mediaVolumeCommitInFlight = false
+    /// 回退通道只提示一次，避免连按刷屏
+    private var mediaVolumeFallbackLogged = false
+
+    /// 收尾提交延迟：首次按下立即下发，这个延迟只决定连按中间值何时被合并。
+    private let mediaVolumeCommitDelay: TimeInterval = 0.12
+
+    /// 默认音频输出是否就是目标显示器 —— 音量键接管门。
+    /// 读不到输出设备时返回 false：宁可交给系统，也不要吞掉按键却没反应。
+    func shouldHandleNativeVolume() -> Bool {
+        guard mediaVolumeKeysEnabled, isConnected else { return false }
+        guard mediaVolumeOutputGateEnabled else { return true }
+        return AudioOutputMonitor.defaultOutputMatches(configuredName: mediaVolumeOutputName)
+    }
+
+    /// 空闲时回读一次音量/静音状态（连接后 + 每 5 秒）。
+    /// 连按/待下发期间跳过，避免把预览基准带偏。
+    func refreshMediaVolumeState() {
+        guard mediaVolumeKeysEnabled, isConnected else { return }
+        guard mediaVolumePreview == nil || mediaVolumePreview == mediaVolumeHardware else { return }
+        runBackground {
+            let volume = self.adb.mediaVolume()
+            let muted = self.adb.mediaMuted()
+            DispatchQueue.main.async {
+                guard self.mediaVolumeKeysEnabled, self.isConnected else { return }
+                if let volume {
+                    self.mediaVolumePreview = volume
+                    self.mediaVolumeHardware = volume
+                }
+                if let muted { self.mediaVolumeMuted = muted }
+            }
+        }
+    }
+
+    private func adjustMediaVolume(increase: Bool) {
+        guard isConnected else { return log("未连接") }
+        guard shouldHandleNativeVolume() else { return }
+
+        let base = mediaVolumePreview ?? mediaVolumeHardware ?? 50
+        let next: Int
+        if mediaVolumeNativeOSD {
+            // 系统 OSD 固定 16 格；开原生 OSD 时每按一次移动一格（和系统音量键一致）
+            let chiclets = NativeOSD.chicletCount
+            let chiclet = Int((Double(base) / 100 * Double(chiclets)).rounded())
+            let target = min(max(chiclet + (increase ? 1 : -1), 0), chiclets)
+            next = clamp(Int((Double(target) / Double(chiclets) * 100).rounded()), 0, 100)
+        } else {
+            let step = max(1, mediaVolumeStep)
+            next = clamp(AppState.alignToStep(base, step: step, increasing: increase), 0, 100)
+        }
+
+        // 静音时按音量键先解除静音（和 macOS/Android 原生行为一致）
+        if mediaVolumeMuted == true { mediaVolumeNeedsUnmute = true }
+        mediaVolumePreview = next
+        mediaVolumeMuted = false
+        currentValues["volume_music_speaker"] = String(next)
+
+        if mediaVolumeNativeOSD, NativeOSD.shared.showVolume(value: next) {
+            // 原生 OSD 自带淡出，不需要收尾
+        } else {
+            HUDWindow.shared.show(title: "音量", value: "\(next)")
+        }
+
+        // 首次按下立即下发；之后连按只更新预览，由收尾任务合并成最后一次
+        if !mediaVolumeCommitInFlight, mediaVolumeCommit == nil {
+            commitMediaVolume()
+        }
+        scheduleMediaVolumeTrailing()
+    }
+
+    /// 安排收尾提交；若那时还有下发在跑，就顺延到它结束。
+    private func scheduleMediaVolumeTrailing() {
+        mediaVolumeCommit?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.mediaVolumeCommitInFlight {
+                self.scheduleMediaVolumeTrailing()
+                return
+            }
+            self.mediaVolumeCommit = nil
+            self.commitMediaVolume()
+        }
+        mediaVolumeCommit = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + mediaVolumeCommitDelay, execute: work)
+    }
+
+    /// 把当前预览值绝对写到设备。目标值和已下发值相同时跳过，避免空跑一次。
+    private func commitMediaVolume() {
+        guard isConnected, let value = mediaVolumePreview else { return }
+        let unmute = mediaVolumeNeedsUnmute
+        guard mediaVolumeHardware != value || unmute else { return }
+        mediaVolumeNeedsUnmute = false
+        mediaVolumeCommitInFlight = true
+        runBackground {
+            let usedBinder = self.adb.setMediaVolume(value, unmuteFirst: unmute)
+            DispatchQueue.main.async {
+                self.mediaVolumeHardware = value
+                self.mediaVolumeCommitInFlight = false
+                if !usedBinder, !self.mediaVolumeFallbackLogged {
+                    self.mediaVolumeFallbackLogged = true
+                    self.log("音量键: AudioService binder 不可用，已回退 input keyevent")
+                }
+            }
+        }
+    }
+
+    private func toggleMediaMute() {
+        guard isConnected else { return log("未连接") }
+        guard shouldHandleNativeVolume() else { return }
+        if let known = mediaVolumeMuted {
+            applyMediaMute(!known)
+        } else {
+            // 状态未知（刚连接/被外部改过）：先回读再切换
+            runBackground {
+                let current = self.adb.mediaMuted() ?? false
+                DispatchQueue.main.async { self.applyMediaMute(!current) }
+            }
+        }
+    }
+
+    private func applyMediaMute(_ muted: Bool) {
+        mediaVolumeMuted = muted
+        // 更新的静音动作覆盖掉「按键先解除静音」的意图，避免收尾提交把它又打开
+        mediaVolumeNeedsUnmute = false
+        if mediaVolumeNativeOSD, NativeOSD.shared.showMute() {
+            // 原生静音 OSD
+        } else {
+            HUDWindow.shared.show(title: "静音", value: muted ? "开" : "关")
+        }
+        runBackground {
+            let usedBinder = self.adb.setMediaMuted(muted)
+            DispatchQueue.main.async {
+                if !usedBinder, !self.mediaVolumeFallbackLogged {
+                    self.mediaVolumeFallbackLogged = true
+                    self.log("静音键: AudioService binder 不可用，已回退 input keyevent")
+                }
+            }
+        }
+    }
+
+    // MARK: - 多屏焦点判断
+
+    /// 目标显示器的 displayID（按系统名称匹配）
+    private var targetMonitorDisplayID: CGDirectDisplayID? {
+        let name = mediaBrightnessDisplayName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return nil }
+        for screen in NSScreen.screens {
+            guard screen.localizedName.localizedCaseInsensitiveContains(name),
+                  let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+            else { continue }
+            return CGDirectDisplayID(number.uint32Value)
+        }
+        return nil
+    }
+
+    /// 鼠标所在的显示器。多屏时用它当「焦点」判据 —— 比取最前面的窗口更直观。
+    private func focusedDisplayID() -> CGDirectDisplayID? {
+        let mouse = NSEvent.mouseLocation
+        if let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }),
+           let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+            return CGDirectDisplayID(number.uint32Value)
+        }
+        return NSScreen.main.flatMap { screen in
+            (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)
+                .map { CGDirectDisplayID($0.uint32Value) }
+        }
+    }
+
+    /// 多屏焦点门：只有鼠标在目标显示器上才拦截亮度键；找不到目标显示器时不过滤。
+    func shouldHandleMediaBrightnessForFocus() -> Bool {
+        guard mediaBrightnessFocusOnly else { return true }
+        guard let target = targetMonitorDisplayID else { return true }
+        return focusedDisplayID() == target
     }
 
     /// 菜单栏面板里的滑块松手：直接设到指定值（而不是加减一个步长）。
@@ -2043,10 +2487,14 @@ final class AppState: ObservableObject {
         /// 暂存一次调整。与 cycleStep 一致：纯尾部，每次改动都重新开始完整倒计时，
         /// 停手后才下发。连续调整时基准取上一次的预览值，所以能连续推进而不是卡住。
         func stage(_ key: String, _ label: String, range: ClosedRange<Int>,
-                   fallback: Int, apply: @escaping (Int) -> Void) {
+                   fallback: Int, alignToStep: Bool = false, apply: @escaping (Int) -> Void) {
             let base: Int
             if let absolute {
                 base = absolute
+            } else if alignToStep {
+                // 首次调整先对齐到步长的倍数，避免出现 6 → 16 这种「半格」起始值
+                let current = adjustPendingValues[param] ?? intValue(key, default: fallback)
+                base = AppState.alignToStep(current, step: abs(delta), increasing: delta > 0)
             } else {
                 base = (adjustPendingValues[param] ?? intValue(key, default: fallback)) + delta
             }
@@ -2079,7 +2527,7 @@ final class AppState: ObservableObject {
 
         switch param {
         case "backlight":
-            stage("picture_backlight", "背光", range: 1...100, fallback: 50) { [weak self] v in
+            stage("picture_backlight", "背光", range: 1...100, fallback: 50, alignToStep: true) { [weak self] v in
                 self?.setPictureSlider(title: "背光", value: v, jniKey: "g_disp__disp_back_light",
                                        settingsKeys: ["picture_backlight", "xiaomi_picture_backlight"])
             }

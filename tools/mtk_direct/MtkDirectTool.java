@@ -112,7 +112,7 @@ public class MtkDirectTool {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
-            log("Usage: MtkDirectTool <get/set/batchGet/getMinMax/setColorGains/setHdrToneMapping/dump> [args]");
+            log("Usage: MtkDirectTool <get/set/ramp/batchGet/getMinMax/setColorGains/setHdrToneMapping/dump> [args]");
             return;
         }
 
@@ -183,6 +183,57 @@ public class MtkDirectTool {
                 int ret = (Integer) setConfigValueNative.invoke(null, -1, key, value, isUpdate);
                 log("RESULT: SET " + key + " to " + value + " (isUpdate=" + isUpdate + "), return: " + ret);
                 writeResult(String.valueOf(ret));
+
+            } else if ("ramp".equals(cmd)) {
+                // 平滑渐变：把 key 从 from 推到 to。
+                // 显示器自带的亮度键就是这样一小步一小步走的，单次大步长会让面板过冲 / 闪。
+                // from 由 App 侧给出（它的粘性预览链），刻意不回读设备 —— JNI 回读值偶发跳变会带偏。
+                // step 控制每步跨度（App 会按 delta 算好，把总步数压在小范围），stepMs 为 0 时不等。
+                if (key == null || args.length < 4) {
+                    log("ERROR: ramp requires <key> <from> <to> [isUpdate] [stepMs] [doneFile] [step]");
+                    writeResult("ERROR");
+                    return;
+                }
+                int from = Integer.parseInt(args[2]);
+                int target = Integer.parseInt(args[3]);
+                int isUpdate = args.length >= 5 ? Integer.parseInt(args[4]) : 3;
+                int stepMs = args.length >= 6 ? Integer.parseInt(args[5]) : 0;
+                String doneFile = args.length >= 7 ? args[6] : null;
+                int stepSize = args.length >= 8 ? Math.max(1, Integer.parseInt(args[7])) : 1;
+                if (doneFile != null && doneFile.length() > 0) {
+                    try {
+                        new File(doneFile).delete();
+                    } catch (Exception e) {
+                        // ignore
+                    }
+                }
+                long rampStartMs = System.currentTimeMillis();
+                int applied = from;
+                int v = from;
+                int step = target >= from ? stepSize : -stepSize;
+                while (true) {
+                    setConfigValueNative.invoke(null, -1, key, v, isUpdate);
+                    applied = v;
+                    if (v == target) {
+                        break;
+                    }
+                    int next = v + step;
+                    if ((step > 0 && next > target) || (step < 0 && next < target)) {
+                        next = target;
+                    }
+                    v = next;
+                    if (stepMs > 0) {
+                        Thread.sleep(stepMs);
+                    }
+                }
+                log("RESULT: RAMP " + key + " " + from + " -> " + target + " isUpdate=" + isUpdate
+                        + " stepMs=" + stepMs + " elapsed=" + (System.currentTimeMillis() - rampStartMs) + "ms");
+                writeResult(String.valueOf(applied));
+                // 渐变完成信号：App 侧等这个文件出现后才会写 settings，
+                // 避免 settings 观察者提前把画面拉到目标值、把渐变打断。
+                if (doneFile != null && doneFile.length() > 0) {
+                    writeFile(doneFile, "1");
+                }
 
             } else if ("getMinMax".equals(cmd)) {
                 if (key == null) {

@@ -2,6 +2,12 @@ import Cocoa
 import Carbon.HIToolbox
 import ApplicationServices
 
+/// NX_SYSDEFINED 事件类型。放在**文件作用域**而不是类型里：
+/// `CGEvent.tapCreate` 的回调是 C 函数指针，闭包不能捕获任何上下文 ——
+/// 连 `Self.systemDefinedEventType`（动态自身类型）都会报
+/// "a C function pointer cannot be formed from a closure that captures dynamic Self type"。
+private let nxSystemDefinedEventType: UInt32 = 14
+
 // MARK: - 快捷键配置模型
 
 struct HotkeyConfig: Codable, Equatable {
@@ -146,7 +152,59 @@ final class HotkeyManager {
         let keyCode: CGKeyCode
     }
 
+    /// 亮度调节键绑定。这类键不在普通 keyDown 的常见键码表里，单独存一份，
+    /// 按 NX_KEYTYPE（调亮 2 / 调暗 3）匹配。
+    private struct MediaBinding {
+        let id: String
+        let keyType: Int32
+    }
+
+    // MARK: 亮度调节键常量
+    //
+    // 同一个「调亮 / 调暗」键在 macOS 上有多种到达形式，全部要覆盖：
+    //   1. NX_SYSDEFINED（事件类型 14）：subtype = 8，data1 高 16 位是键类型
+    //      （调亮 2 / 调暗 3）、bit 8~15 是按下/抬起。值是 IOKit ev_keymap.h 的定义。
+    //   2. 普通 keyDown keyCode 144 / 145（调亮 / 调暗）：Apple 内置键盘常见。
+    //   3. 普通 keyDown 的 F2 / F1：用户在系统设置里开了「功能键当标准功能键」时。
+    // 1、2 会在回调里返回 nil 吞掉事件；3 不吞（避免劫持真实的 F1/F2）。
+    private static let auxControlButtonSubtype: Int16 = 8
+    private static let mediaKeyStateDown: Int = 0xA
+    static let keyTypeBrightnessUp: Int32 = 2      // NX_KEYTYPE_BRIGHTNESS_UP
+    static let keyTypeBrightnessDown: Int32 = 3    // NX_KEYTYPE_BRIGHTNESS_DOWN
+    static let keyTypeVolumeUp: Int32 = 0          // NX_KEYTYPE_SOUND_UP
+    static let keyTypeVolumeDown: Int32 = 1        // NX_KEYTYPE_SOUND_DOWN
+    static let keyTypeMute: Int32 = 7              // NX_KEYTYPE_MUTE
+    static let mediaBrightnessUpID = "media_brightness_up"
+    static let mediaBrightnessDownID = "media_brightness_down"
+    static let mediaVolumeUpID = "media_volume_up"
+    static let mediaVolumeDownID = "media_volume_down"
+    static let mediaMuteID = "media_volume_mute"
+    /// 媒体键以普通 keyDown 到达时的键码（亮度 144/145、音量 72/73/74）。
+    private static let mediaKeyDownBrightnessUp: Int64 = 144
+    private static let mediaKeyDownBrightnessDown: Int64 = 145
+    private static let mediaKeyDownVolumeUp: Int64 = 72
+    private static let mediaKeyDownVolumeDown: Int64 = 73
+    private static let mediaKeyDownMute: Int64 = 74
+    /// 功能键当标准功能键时的兜底键码
+    /// （调亮 F2 / 调暗 F1、音量加 F12 / 减 F11 / 静音 F10）。
+    static let keyCodeBrightnessUp = CGKeyCode(kVK_F2)
+    static let keyCodeBrightnessDown = CGKeyCode(kVK_F1)
+    static let keyCodeVolumeUp = CGKeyCode(kVK_F12)
+    static let keyCodeVolumeDown = CGKeyCode(kVK_F11)
+    static let keyCodeMute = CGKeyCode(kVK_F10)
+
+    /// 是否是亮度键的 NX_KEYTYPE
+    static func isBrightnessKeyType(_ keyType: Int32) -> Bool {
+        keyType == keyTypeBrightnessUp || keyType == keyTypeBrightnessDown
+    }
+
+    /// 是否是音量键的 NX_KEYTYPE（含静音）
+    static func isVolumeKeyType(_ keyType: Int32) -> Bool {
+        keyType == keyTypeVolumeUp || keyType == keyTypeVolumeDown || keyType == keyTypeMute
+    }
+
     private var bindings: [Binding] = []
+    private var mediaBindings: [MediaBinding] = []
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
@@ -159,6 +217,13 @@ final class HotkeyManager {
 
     /// 诊断用：收到任意按键事件时回调
     var onKeyEvent: ((CGEvent) -> Void)?
+
+    /// 诊断用：收到系统媒体键（亮度/音量…）时回调，参数为键类型与是否按下
+    var onMediaKeyEvent: ((Int32, Bool) -> Void)?
+
+    /// 媒体键是否该由本应用处理（参数为 NX_KEYTYPE）。返回 false 时事件原样放行给系统
+    /// —— 亮度键看焦点是否在目标显示器上，音量键看当前音频输出是不是显示器。
+    var shouldHandleMediaKey: ((Int32) -> Bool)?
 
     /// 监听被系统禁用时回调
     var onTapDisabled: (() -> Void)?
@@ -174,7 +239,23 @@ final class HotkeyManager {
                                 keyCode: keyCode))
     }
 
-    func clear() { bindings.removeAll() }
+    /// 注册一个系统媒体键（目前用于硬件亮度键）。
+    func registerMedia(id: String, keyType: Int32) {
+        mediaBindings.removeAll { $0.id == id }
+        mediaBindings.append(MediaBinding(id: id, keyType: keyType))
+    }
+
+    /// 注册一个不带修饰键的普通按键。给硬件亮度键做兼容：
+    /// 系统若把 F1/F2 当标准功能键，就只会发 keyDown，不会发 NX_SYSDEFINED。
+    func registerRaw(id: String, keyCode: CGKeyCode) {
+        bindings.removeAll { $0.id == id }
+        bindings.append(Binding(id: id, modifiers: [], keyCode: keyCode))
+    }
+
+    func clear() {
+        bindings.removeAll()
+        mediaBindings.removeAll()
+    }
 
     /// 返回是否成功建立了事件监听。
     /// `tapCreate` 在缺权限时会直接返回 nil —— 这种情况必须让调用方知道，
@@ -182,7 +263,9 @@ final class HotkeyManager {
     @discardableResult
     func start() -> Bool {
         if eventTap != nil { return true }
-        let mask = CGEventMask(1) << CGEventType.keyDown.rawValue
+        // 普通按键是 keyDown；硬件亮度键是 NX_SYSDEFINED（类型 14），两种都要听。
+        let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue)
+            | (CGEventMask(1) << nxSystemDefinedEventType)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -204,7 +287,13 @@ final class HotkeyManager {
                 if type == .keyDown {
                     manager.receivedKeyEvents += 1
                     manager.onKeyEvent?(event)
+                    // 亮度调节键若以普通 keyDown 到达（keyCode 144/145），先拦下并吞掉，
+                    // 否则内置屏会跟着变亮度。
+                    if manager.handleMediaKeyDown(event) { return nil }
                     manager.handle(event)
+                } else if type.rawValue == nxSystemDefinedEventType {
+                    // 命中我们注册的亮度键就吞掉（返回 nil），内置屏幕不再改亮度。
+                    if manager.handleSystemDefined(event) { return nil }
                 }
                 return Unmanaged.passUnretained(event)
             },
@@ -222,6 +311,9 @@ final class HotkeyManager {
 
     /// 已注册的绑定数量（用于诊断）
     var bindingCount: Int { bindings.count }
+
+    /// 已注册的系统媒体键数量（用于诊断）
+    var mediaBindingCount: Int { mediaBindings.count }
 
     func stop() {
         if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: false) }
@@ -247,8 +339,63 @@ final class HotkeyManager {
         }
     }
 
+    /// 处理「亮度调节键被当作普通 keyDown」的情况（keyCode 144/145）。
+    /// 命中已注册的亮度绑定就触发并返回 true，让回调吞掉事件。
+    private func handleMediaKeyDown(_ event: CGEvent) -> Bool {
+        guard !mediaBindings.isEmpty else { return false }
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        guard let keyType = Self.mediaKeyType(forKeyCode: keyCode) else { return false }
+        guard shouldHandleMediaKey?(keyType) ?? true else { return false }
+        for binding in mediaBindings where binding.keyType == keyType {
+            onTrigger?(binding.id)
+            return true
+        }
+        return false
+    }
+
+    /// 把「以普通 keyDown 到达」的媒体键键码映射到 NX_KEYTYPE。抽出来方便单测。
+    static func mediaKeyType(forKeyCode keyCode: Int64) -> Int32? {
+        switch keyCode {
+        case mediaKeyDownBrightnessUp: return keyTypeBrightnessUp
+        case mediaKeyDownBrightnessDown: return keyTypeBrightnessDown
+        case mediaKeyDownVolumeUp: return keyTypeVolumeUp
+        case mediaKeyDownVolumeDown: return keyTypeVolumeDown
+        case mediaKeyDownMute: return keyTypeMute
+        default: return nil
+        }
+    }
+
+    /// 处理 NX_SYSDEFINED 事件。返回 true 表示这是已注册的亮度调节键，
+    /// 调用方应返回 nil 把事件吞掉。
+    private func handleSystemDefined(_ event: CGEvent) -> Bool {
+        guard let nsEvent = NSEvent(cgEvent: event) else { return false }
+        guard nsEvent.subtype.rawValue == Self.auxControlButtonSubtype else { return false }
+        let (keyType, isDown) = Self.parseMediaKey(data1: nsEvent.data1)
+        onMediaKeyEvent?(keyType, isDown)
+        // 只看按下，抬起事件原样放行
+        guard isDown else { return false }
+        receivedMediaKeyEvents += 1
+        guard shouldHandleMediaKey?(keyType) ?? true else { return false }
+        for binding in mediaBindings where binding.keyType == keyType {
+            onTrigger?(binding.id)
+            return true
+        }
+        return false
+    }
+
+    /// 解析 NX_SYSDEFINED 的 `data1`：高 16 位是媒体键类型，
+    /// bit 8~15 是状态（0xA 按下 / 0xB 抬起）。抽出来方便单测。
+    static func parseMediaKey(data1: Int) -> (keyType: Int32, isDown: Bool) {
+        let keyType = Int32(truncatingIfNeeded: (data1 & 0xFFFF0000) >> 16)
+        let isDown = (data1 & 0xFF00) >> 8 == mediaKeyStateDown
+        return (keyType, isDown)
+    }
+
     /// 事件是否已到达监听（用于诊断）
     private(set) var receivedKeyEvents = 0
+
+    /// 系统媒体键事件计数（用于诊断）
+    private(set) var receivedMediaKeyEvents = 0
 
     // MARK: 权限
 
