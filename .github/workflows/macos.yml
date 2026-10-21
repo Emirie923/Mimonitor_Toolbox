@@ -34,7 +34,10 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14
+    # 必须是 macOS 26 的 runner + SDK：SwiftUI 的 Liquid Glass（26 外观）
+    # 由**链接时的 SDK** 决定，不是代码里能开关的。macos-14/15 的 SDK
+    # 打出来的包在 26 上也是旧版（15）外观。macos-14 镜像 2026-11-02 退役。
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +65,13 @@ jobs:
       - name: 工具链版本
         run: |
           swift --version
+          xcodebuild -version
+          SDK=$(xcrun --show-sdk-version)
+          echo "macOS SDK: $SDK"
+          case "$SDK" in
+            26.*) ;;
+            *) echo "::warning::当前 SDK 不是 26.x，构建出的界面会是 macOS 15 外观" ;;
+          esac
           sw_vers
 
       - name: 编译（debug，先过一遍语法检查）
